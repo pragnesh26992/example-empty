@@ -3,6 +3,8 @@
 
 PROGRAM ?= empty
 
+LOADLIBES += -lopen_amp -lmetal_2
+
 $(PROGRAM): $(wildcard *.c) $(wildcard *.h) $(wildcard *.S)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(filter %.c %.S,$^) $(LOADLIBES) $(LDLIBS) -o $@
 
