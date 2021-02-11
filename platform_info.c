@@ -27,7 +27,107 @@
 #include "platform_info.h"
 #include "rsc_table.h"
 
+#define KICK_DEV_NAME         "poll_dev"
+#define KICK_BUS_NAME         "generic"
+
+/* Cortex R5 memory attributes */
+#define DEVICE_SHARED           0x00000001U /* device, shareable */
+#define DEVICE_NONSHARED        0x00000010U /* device, non shareable */
+#define NORM_NSHARED_NCACHE     0x00000008U /* Non cacheable  non shareable */
+#define NORM_SHARED_NCACHE      0x0000000CU /* Non cacheable shareable */
+#define PRIV_RW_USER_RW         (0x00000003U<<8U) /* Full Access */
+
+#define SHARED_MEM_PA  0x90000000UL
+#define SHARED_MEM_SIZE 0x100000UL
+#define SHARED_BUF_OFFSET 0x8000UL
+
+//#define SHARED_MEM_SIZE 0x80000UL
+//#define SHARED_BUF_OFFSET 0x80000UL
+
+#ifndef RPMSG_NO_IPI
 #define _rproc_wait() asm volatile("wfi")
+#endif /* !RPMSG_NO_IPI */
+
+/* Polling information used by remoteproc operations.
+ */
+static metal_phys_addr_t poll_phys_addr = POLL_BASE_ADDR;
+
+/* Place resource table in special ELF section */
+  /* Redefine __section for section name with token */
+#define __section_t(S)          __attribute__((__section__(#S)))
+#define __resource              __section_t(.resource_table)
+
+#define RPMSG_IPU_C0_FEATURES        1
+
+/* VirtIO rpmsg device id */
+#define VIRTIO_ID_RPMSG_             7
+
+/* Remote supports Name Service announcement */
+#define VIRTIO_RPMSG_F_NS           0
+
+/* Resource table entries */
+#define NUM_VRINGS                  0x02
+#define VRING_ALIGN                 0x1000
+#define RING_TX                     0x90020000
+#define RING_RX                     0x90040000
+#define VRING_SIZE                  256
+
+#define NUM_TABLE_ENTRIES           1
+
+struct remote_resource_table resources = {
+        /* Version */
+        1,
+
+        /* NUmber of table entries */
+        NUM_TABLE_ENTRIES,
+        /* reserved fields */
+        {0, 0,},
+
+        /* Offsets of rsc entries */
+        {
+         offsetof(struct remote_resource_table, rpmsg_vdev),
+         },
+
+        /* Virtio device entry */
+        {
+         RSC_VDEV, VIRTIO_ID_RPMSG_, RSC_NOTIFY_ID_ANY, RPMSG_IPU_C0_FEATURES, 0, 0, 0,
+         NUM_VRINGS, {0, 0},
+        },
+
+        /* Vring rsc entry - part of vdev rsc entry */
+        {RING_TX, VRING_ALIGN, VRING_SIZE, 1, 0},
+        {RING_RX, VRING_ALIGN, VRING_SIZE, 2, 0},
+};
+
+struct metal_device kick_device = {
+        .name = "poll_dev",
+        .bus = NULL,
+        .num_regions = 1,
+        .regions = {
+                {
+                        .virt = (void *)POLL_BASE_ADDR,
+                        .physmap = &poll_phys_addr,
+                        .size = 0x1000,
+                        .page_shift = -1UL,
+                        .page_mask = -1UL,
+                        .mem_flags = DEVICE_NONSHARED | PRIV_RW_USER_RW,
+                        .ops = {NULL},
+                }
+        },
+        .node = {NULL},
+#ifndef RPMSG_NO_IPI
+        .irq_num = 1,
+        .irq_info = (void *)IPI_IRQ_VECT_ID,
+#endif /* !RPMSG_NO_IPI */
+};
+
+static struct remoteproc_priv rproc_priv = {
+        .kick_dev_name = KICK_DEV_NAME,
+        .kick_dev_bus_name = KICK_BUS_NAME,
+#ifndef RPMSG_NO_IPI
+        .ipi_chn_mask = IPI_CHN_BITMASK,
+#endif /* !RPMSG_NO_IPI */
+};
 
 /* processor operations for hil_proc for A9. It defines
  * notification operation and remote processor management. */
@@ -39,6 +139,9 @@ static struct remoteproc rproc_inst;
 /* External functions */
 extern int init_system(void);
 extern void cleanup_system(void);
+
+/* RPMsg virtio shared buffer pool */
+static struct rpmsg_virtio_shm_pool shpool;
 
 static struct remoteproc *
 platform_create_proc(int proc_index, int rsc_index)
@@ -52,8 +155,12 @@ platform_create_proc(int proc_index, int rsc_index)
 	(void) proc_index;
 	rsc_table = get_resource_table(rsc_index, &rsc_size);
 
+        /* Register IPI device */
+        if (metal_register_generic_device(&kick_device))
+                return NULL;
+
 	/* Initialize remoteproc instance */
-	if (!remoteproc_init(&rproc_inst, &sifive_u_proc_ops, NULL))
+	if (!remoteproc_init(&rproc_inst, &sifive_u_proc_ops, &rproc_priv))
 		return NULL;
 
 	/*
@@ -118,8 +225,7 @@ int platform_init(int argc, char *argv[], void **platform)
 	return 0;
 }
 
-/* RPMsg virtio shared buffer pool */
-static struct rpmsg_virtio_shm_pool shpool;
+
 
 struct  rpmsg_device *
 platform_create_rpmsg_vdev(void *platform, unsigned int vdev_index,
@@ -185,19 +291,58 @@ err1:
 
 int platform_poll(void *priv)
 {
-	struct remoteproc *rproc = priv;
+        struct remoteproc *rproc = priv;
+        struct remoteproc_priv *prproc;
+        unsigned int flags;
+        int ret;
 
-	while(1) {
-		remoteproc_get_notification(rproc, RSC_NOTIFY_ID_ANY);
-		break;
-//		_rproc_wait();
+        prproc = rproc->priv;
+
+        while(1) {
+#ifdef RPMSG_NO_IPI
+                volatile char *done_polling = (volatile char *)POLL_BASE_ADDR;
+                (void)flags;
+                if (*done_polling) {
+                        remoteproc_get_notification(rproc, RSC_NOTIFY_ID_ANY);
+                        break;
+                }
+/*
+                if (metal_io_read32(prproc->kick_io, 0)) {
+                        ret = remoteproc_get_notification(rproc,
+                                                          RSC_NOTIFY_ID_ANY);
+                        if (ret)
+                                return ret;
+                        break;
+                }
+                (void)flags;
+*/
+#else /* !RPMSG_NO_IPI */
+                flags = metal_irq_save_disable();
+                if (!(atomic_flag_test_and_set(&prproc->ipi_nokick))) {
+                        metal_irq_restore_enable(flags);
+                        ret = remoteproc_get_notification(rproc,
+                                                          RSC_NOTIFY_ID_ANY);
+                        if (ret)
+                                return ret;
+                        break;
+                }
+                _rproc_wait();
+                metal_irq_restore_enable(flags);
+#endif /* RPMSG_NO_IPI */
 	}
 	return 0;
 }
 
-void platform_release_rpmsg_vdev(struct rpmsg_device *rpdev)
+void platform_release_rpmsg_vdev(struct rpmsg_device *rpdev, void *platform)
 {
-	(void)rpdev;
+        struct rpmsg_virtio_device *rpvdev;
+        struct remoteproc *rproc;
+
+        rpvdev = metal_container_of(rpdev, struct rpmsg_virtio_device, rdev);
+        rproc = platform;
+
+        rpmsg_deinit_vdev(rpvdev);
+        remoteproc_remove_virtio(rproc, rpvdev->vdev);
 }
 
 void platform_cleanup(void *platform)
